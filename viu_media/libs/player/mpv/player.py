@@ -97,7 +97,10 @@ class MpvPlayer(BasePlayer):
                 "is.xyz.mpv/.MPVActivity",
             ]
 
-        subprocess.run(args,env=detect.get_clean_env())
+        subprocess.run(args,env={**detect.get_clean_env(), **{
+    "HOME": os.environ.get("HOME"),
+    "XDG_CONFIG_HOME": os.environ.get("XDG_CONFIG_HOME"),
+}})
 
         return PlayerResult(params.episode)
 
