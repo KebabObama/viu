@@ -1,12 +1,10 @@
 """
 MPV player integration for Viu.
 
-This module provides the MpvPlayer class, which implements the BasePlayer interface
-for the MPV media player.
+This module provides the MpvPlayer class, which implements the BasePlayer interface for the MPV media player.
 """
 
 import logging
-import os
 import re
 import shutil
 import subprocess
@@ -27,15 +25,30 @@ MPV_AV_TIME_PATTERN = re.compile(r"AV: ([0-9:]*) / ([0-9:]*) \(([0-9]*)%\)")
 class MpvPlayer(BasePlayer):
     """
     MPV player implementation for Viu.
+
+    Provides playback functionality using the MPV media player, supporting desktop, mobile, torrents, and syncplay.
     """
 
     def __init__(self, config: MpvConfig):
+        """
+        Initialize the MpvPlayer with the given MPV configuration.
+
+        Args:
+            config: MpvConfig object containing MPV-specific settings.
+        """
         self.config = config
         self.executable = shutil.which("mpv")
 
-    # ---------- public API ----------
+    def play(self, params):
+        """
+        Play the given media using MPV, handling desktop, mobile, torrent, and syncplay scenarios.
 
-    def play(self, params: PlayerParams) -> PlayerResult:
+        Args:
+            params: PlayerParams object containing playback parameters.
+
+        Returns:
+            PlayerResult: Information about the playback session.
+        """
         if TORRENT_REGEX.match(params.url) and detect.is_running_in_termux():
             raise ViuError("Unable to play torrents on termux")
         elif params.syncplay and detect.is_running_in_termux():
@@ -45,9 +58,16 @@ class MpvPlayer(BasePlayer):
         else:
             return self._play_on_desktop(params)
 
-    # ---------- mobile ----------
+    def _play_on_mobile(self, params) -> PlayerResult:
+        """
+        Play media on a mobile device using Android intents.
 
-    def _play_on_mobile(self, params: PlayerParams) -> PlayerResult:
+        Args:
+            params: PlayerParams object containing playback parameters.
+
+        Returns:
+            PlayerResult: Information about the playback session.
+        """
         if YOUTUBE_REGEX.match(params.url):
             args = [
                 "nohup",
@@ -77,12 +97,20 @@ class MpvPlayer(BasePlayer):
                 "is.xyz.mpv/.MPVActivity",
             ]
 
-        subprocess.run(args, env=detect.get_clean_env())
+        subprocess.run(args,env = os.environ.copy())
+
         return PlayerResult(params.episode)
 
-    # ---------- desktop ----------
+    def _play_on_desktop(self, params) -> PlayerResult:
+        """
+        Play media on a desktop environment using MPV.
 
-    def _play_on_desktop(self, params: PlayerParams) -> PlayerResult:
+        Args:
+            params: PlayerParams object containing playback parameters.
+
+        Returns:
+            PlayerResult: Information about the playback session.
+        """
         if not self.executable:
             raise ViuError("MPV executable not found in PATH.")
 
@@ -93,12 +121,24 @@ class MpvPlayer(BasePlayer):
         else:
             return self._stream_on_desktop_with_subprocess(params)
 
-    def _stream_on_desktop_with_subprocess(
-        self, params: PlayerParams
-    ) -> PlayerResult:
-        mpv_args = self._base_mpv_args(params)
+    def _stream_on_desktop_with_subprocess(self, params: PlayerParams) -> PlayerResult:
+        """
+        Stream media using MPV via subprocess, capturing playback times.
 
-        pre_args = self._pre_args()
+        Args:
+            params: PlayerParams object containing playback parameters.
+
+        Returns:
+            PlayerResult: Information about the playback session, including stop and total time.
+        """
+        mpv_args = [self.executable, params.url]
+
+        mpv_args.extend(self._create_mpv_cli_options(params))
+
+        pre_args = self.config.pre_args.split(",") if self.config.pre_args else []
+
+        stop_time = None
+        total_time = None
 
         proc = subprocess.run(
             pre_args + mpv_args,
@@ -108,10 +148,6 @@ class MpvPlayer(BasePlayer):
             check=False,
             env=detect.get_clean_env(),
         )
-
-        stop_time = None
-        total_time = None
-
         if proc.stdout:
             for line in reversed(proc.stdout.split("\n")):
                 match = MPV_AV_TIME_PATTERN.search(line.strip())
@@ -119,88 +155,101 @@ class MpvPlayer(BasePlayer):
                     stop_time = match.group(1)
                     total_time = match.group(2)
                     break
-
         return PlayerResult(
-            episode=params.episode,
-            total_time=total_time,
-            stop_time=stop_time,
+            episode=params.episode, total_time=total_time, stop_time=stop_time
         )
 
-    def play_with_ipc(
-        self, params: PlayerParams, socket_path: str
-    ) -> subprocess.Popen:
+    def play_with_ipc(self, params: PlayerParams, socket_path: str) -> subprocess.Popen:
+        """
+        Stream using MPV with IPC (Inter-Process Communication) for enhanced features.
+
+        Args:
+            params: PlayerParams object containing playback parameters.
+            socket_path: Path to the IPC socket for player control.
+
+        Returns:
+            subprocess.Popen: The running MPV process.
+        """
         mpv_args = [
             self.executable,
             f"--input-ipc-server={socket_path}",
             "--idle=yes",
             "--force-window=yes",
-            "--config-dir=" + self._mpv_config_dir(),
             params.url,
         ]
 
+        # Add custom MPV arguments
         mpv_args.extend(self._create_mpv_cli_options(params))
+
+        # Add pre-args if configured
+        pre_args = self.config.pre_args.split(",") if self.config.pre_args else []
 
         logger.info(f"Starting MPV with IPC socket: {socket_path}")
 
-        return subprocess.Popen(
-            self._pre_args() + mpv_args,
-            env=detect.get_clean_env(),
-        )
+        process = subprocess.Popen(pre_args + mpv_args,env=detect.get_clean_env())
+
+        return process
 
     def _stream_on_desktop_with_webtorrent_cli(
         self, params: PlayerParams
     ) -> PlayerResult:
-        webtorrent = shutil.which("webtorrent")
-        if not webtorrent:
-            raise ViuError("Please install webtorrent-cli")
+        """
+        Stream torrent media using the webtorrent CLI and MPV.
 
-        args = [webtorrent, params.url, "--mpv"]
+        Args:
+            params: PlayerParams object containing playback parameters.
 
+        Returns:
+            PlayerResult: Information about the playback session.
+        """
+        WEBTORRENT_CLI = shutil.which("webtorrent")
+        if not WEBTORRENT_CLI:
+            raise ViuError("Please Install webtorrent cli inorder to stream torrents")
+
+        args = [WEBTORRENT_CLI, params.url, "--mpv"]
         if mpv_args := self._create_mpv_cli_options(params):
             args.append("--player-args")
             args.extend(mpv_args)
 
-        subprocess.run(args, env=detect.get_clean_env())
+        subprocess.run(args,env=detect.get_clean_env())
         return PlayerResult(params.episode)
 
-    def _stream_on_desktop_with_syncplay(
-        self, params: PlayerParams
-    ) -> PlayerResult:
-        syncplay = shutil.which("syncplay")
-        if not syncplay:
-            raise ViuError("Please install syncplay")
+    def _stream_on_desktop_with_syncplay(self, params: PlayerParams) -> PlayerResult:
+        """
+        Stream media using Syncplay for synchronized playback with friends.
 
-        args = [syncplay, params.url]
+        Args:
+            params: PlayerParams object containing playback parameters.
 
-        if mpv_args := self._base_mpv_args(params):
+        Returns:
+            PlayerResult: Information about the playback session.
+        """
+        SYNCPLAY_EXECUTABLE = shutil.which("syncplay")
+        if not SYNCPLAY_EXECUTABLE:
+            raise ViuError(
+                "Please install syncplay to be able to stream with your friends"
+            )
+        args = [SYNCPLAY_EXECUTABLE, params.url]
+        if mpv_args := self._create_mpv_cli_options(params):
             args.append("--")
             args.extend(mpv_args)
+        subprocess.run(args,env=detect.get_clean_env())
 
-        subprocess.run(args, env=detect.get_clean_env())
         return PlayerResult(params.episode)
 
-    # ---------- helpers ----------
-
-    def _mpv_config_dir(self) -> str:
-        return os.path.expanduser("~/.config/mpv")
-
-    def _base_mpv_args(self, params: PlayerParams) -> list[str]:
-        args = [
-            self.executable,
-            "--config-dir=" + self._mpv_config_dir(),
-            params.url,
-        ]
-        args.extend(self._create_mpv_cli_options(params))
-        return args
-
-    def _pre_args(self) -> list[str]:
-        return self.config.pre_args.split(",") if self.config.pre_args else []
-
     def _create_mpv_cli_options(self, params: PlayerParams) -> list[str]:
-        mpv_args: list[str] = []
+        """
+        Create a list of MPV CLI options based on playback parameters.
 
+        Args:
+            params: PlayerParams object containing playback parameters.
+
+        Returns:
+            list[str]: List of MPV CLI arguments.
+        """
+        mpv_args = []
         if params.headers:
-            header_str = ",".join(f"{k}:{v}" for k, v in params.headers.items())
+            header_str = ",".join([f"{k}:{v}" for k, v in params.headers.items()])
             mpv_args.append(f"--http-header-fields={header_str}")
 
         if params.subtitles:
@@ -215,7 +264,6 @@ class MpvPlayer(BasePlayer):
 
         if self.config.args:
             mpv_args.extend(self.config.args.split(","))
-
         return mpv_args
 
 
@@ -225,5 +273,5 @@ if __name__ == "__main__":
     print(APP_ASCII_ART)
     url = input("Enter the url you would like to stream: ")
     mpv = MpvPlayer(MpvConfig())
-    result = mpv.play(PlayerParams(episode="", query="", url=url, title=""))
-    print(result)
+    player_result = mpv.play(PlayerParams(episode="", query="", url=url, title=""))
+    print(player_result)
